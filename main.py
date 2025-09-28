@@ -12,12 +12,14 @@ WBUY_TOKEN = (os.getenv("WBUY_TOKEN") or "").strip()
 PORT       = int(os.getenv("PORT", "5000"))
 
 HEADERS = {
-    # tenta os dois formatos ao mesmo tempo
     "Authorization": f"Bearer {WBUY_TOKEN}" if WBUY_TOKEN else "",
     "token": WBUY_TOKEN or "",
+    "X-Auth-Token": WBUY_TOKEN or "",
     "Accept": "application/json",
     "Content-Type": "application/json",
+    "User-Agent": "MartierCorreiosAPI/1.0",
 }
+
 
 
 # candidatos para auto-detecção
