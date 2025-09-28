@@ -20,9 +20,6 @@ HEADERS = {
     "User-Agent": "MartierCorreiosAPI/1.0",
 }
 
-
-
-# candidatos para auto-detecção
 LIST_ENDPOINTS     = ["order", "orders", "pedido", "pedidos"]
 STATUS_PARAM_KEYS  = ["status", "situacao"]
 
@@ -36,20 +33,13 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 def _ok(r): return r.status_code in (200, 201, 202)
 
 def _dt(date_str):
-    """YYYY-MM-DD -> date | None"""
-    if not date_str:
-        return None
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d").date()
-    except Exception:
-        return None
+    if not date_str: return None
+    try: return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception: return None
 
 def _unwrap_list(obj):
-    """Normaliza diferentes formatos para lista."""
-    if obj is None:
-        return []
-    if isinstance(obj, list):
-        return obj
+    if obj is None: return []
+    if isinstance(obj, list): return obj
     if isinstance(obj, dict):
         for k in ("data", "results", "items", "orders", "pedidos"):
             v = obj.get(k)
@@ -58,8 +48,13 @@ def _unwrap_list(obj):
         return [obj]
     return []
 
+def _auth_params(extra=None):
+    """Garante token na querystring (algumas contas exigem)."""
+    p = {"token": WBUY_TOKEN} if WBUY_TOKEN else {}
+    if extra: p.update(extra)
+    return p
+
 def _extract_tracking(o):
-    """Extrai código de rastreio (prioriza frete.rastreio)."""
     f = o.get("frete") or {}
     ship = o.get("shipping") or {}
     cands = [
@@ -73,8 +68,7 @@ def _extract_tracking(o):
         o.get("tracking_code"),
     ]
     for c in cands:
-        if c:
-            return str(c).strip().upper()
+        if c: return str(c).strip().upper()
     return ""
 
 def _extract_service(o):
@@ -86,7 +80,6 @@ def _is_tracking(s): return bool(re.match(r"^[A-Z]{2}\d{9}BR$", (s or "").strip(
 def _is_order_id(s): return (s or "").strip().isdigit()
 
 def _created_any(o):
-    """Tenta várias chaves de data; retorna (raw, date|None)."""
     raw = (o.get("data") or o.get("created_at") or o.get("criado_em") or o.get("date") or "")
     s = str(raw)[:10]
     return raw, _dt(s)
@@ -103,9 +96,6 @@ def health():
 # --------------- Diagnóstico ---------------
 @app.get("/api/wbuy/probe")
 def probe():
-    """
-    Faz tentativas com endpoints/chaves de status diferentes e mostra um sample.
-    """
     page = int(request.args.get("page") or 1)
     page_size = int(request.args.get("page_size") or 50)
     passed_status = request.args.get("status")
@@ -113,11 +103,12 @@ def probe():
     tried = []
     for ep in LIST_ENDPOINTS:
         for key in STATUS_PARAM_KEYS + [None]:
-            params = {"page": page, "page_size": page_size}
+            params = _auth_params({"page": page, "page_size": page_size})
             if passed_status and key:
                 params[key] = passed_status
             url = f"{API_URL}/{ep}"
             r = requests.get(url, headers=HEADERS, params=params, timeout=40)
+
             item = {"endpoint": ep, "status_key": key, "http": r.status_code}
             try:
                 js = r.json() if r.text else {}
@@ -129,25 +120,15 @@ def probe():
             item["params"] = params
             item["sample"] = (items[0] if items else None)
             tried.append(item)
+
             if _ok(r) and items:
                 return jsonify({"ok": True, "best": item, "tried": tried})
+
     return jsonify({"ok": False, "message": "Nenhum item retornou.", "tried": tried})
 
 # --------------- Listagem por período ---------------
 @app.get("/api/wbuy/orders")
 def list_orders():
-    """
-    Lista pedidos com ID e código de rastreio.
-    Params:
-      - from: YYYY-MM-DD (opcional; default = hoje-30d)
-      - to:   YYYY-MM-DD (opcional; default = hoje)
-      - q:    orderId numérico OU código de rastreio (opcional)
-      - status: pode repetir ?status=5&status=7 (opcional)
-      - page_size: int (default 100)
-      - max_pages: int (default 8)
-    Retorno:
-      { ok, from, to, count, rows: [{orderId, numero, tracking, service, createdAt, updatedAt}] }
-    """
     if not WBUY_TOKEN:
         return jsonify({"ok": False, "error": "WBUY_TOKEN ausente"}), 500
 
@@ -158,15 +139,14 @@ def list_orders():
     page_size = int(request.args.get("page_size") or 100)
     max_pages = int(request.args.get("max_pages") or 8)
 
-    # status desejados (opcional)
     statuses = [s for s in request.args.getlist("status") if s.isdigit()]
-    default_statuses = [str(i) for i in range(1, 19)]  # fallback comum
+    default_statuses = [str(i) for i in range(1, 19)]
 
-    # Atalho: detalhe por orderId
+    # detalhe por orderId
     if _is_order_id(q):
         for ep in LIST_ENDPOINTS:
             u = f"{API_URL}/{ep}/{q}"
-            r = requests.get(u, headers=HEADERS, timeout=30)
+            r = requests.get(u, headers=HEADERS, params=_auth_params(), timeout=40)
             if _ok(r):
                 o = r.json() if r.text else {}
                 if isinstance(o, dict) and "data" in o and isinstance(o["data"], list) and o["data"]:
@@ -194,8 +174,8 @@ def list_orders():
                 for st in sts:
                     for page in range(1, max_pages + 1):
                         params = {"page": page, "page_size": page_size}
-                        if key and st:
-                            params[key] = st
+                        if key and st: params[key] = st
+                        params = _auth_params(params)
                         url = f"{API_URL}/{ep}"
                         r = requests.get(url, headers=HEADERS, params=params, timeout=40)
                         if not _ok(r):
@@ -211,9 +191,8 @@ def list_orders():
                             break
                         for o in items:
                             raw, created_date = _created_any(o)
-                            if created_date:
-                                if created_date < dfrom or created_date > dto:
-                                    continue
+                            if created_date and (created_date < dfrom or created_date > dto):
+                                continue
                             oid = o.get("id")
                             if not oid or oid in seen:
                                 continue
@@ -229,15 +208,13 @@ def list_orders():
                             added += 1
                         if len(items) < page_size:
                             break
-        return acc if added or not isinstance(acc, dict) else acc
+        return acc
 
-    # 1ª passada: com status
     out = fetch(with_status=True)
     if isinstance(out, dict) and out.get("error"):
         return jsonify({"ok": False, **out}), 502
     rows.extend(out)
 
-    # fallback: sem status (caso a API ignore/filtre demais)
     if not rows:
         out = fetch(with_status=False)
         if isinstance(out, dict) and out.get("error"):
