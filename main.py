@@ -1,6 +1,7 @@
+# main.py
 from flask import Flask, jsonify, request, make_response, Blueprint
 from flask_cors import CORS
-import os, requests, json
+import os, requests
 
 # ==============================
 # Config
@@ -22,7 +23,8 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # ------------------------------ Helpers ------------------------------
-def _ok(r): return r.status_code in (200, 201, 202)
+def _ok(r): 
+    return r.status_code in (200, 201, 202)
 
 def _json_safe(resp):
     try:
@@ -35,13 +37,15 @@ def _json_safe(resp):
 
 def _num_centavos(v):
     """Normaliza dinheiro (aceita int/float/str BR) -> centavos (int)."""
-    if v is None: return 0
+    if v is None:
+        return 0
     if isinstance(v, (int, float)):
         if isinstance(v, float) and v < 1000:
             return int(round(v * 100))
         return int(round(v))
     s = str(v).strip()
-    if not s: return 0
+    if not s:
+        return 0
     s = s.replace(".", "").replace(",", ".")
     try:
         return int(round(float(s) * 100))
@@ -50,17 +54,21 @@ def _num_centavos(v):
 
 def _unwrap_first(obj):
     """
-    Retorna o primeiro objeto "pedido" de formatos típicos:
+    Retorna o primeiro objeto 'pedido' para formatos:
       {'data': {...}} | {'data': [{...}]} | [{...}] | {...}
     """
-    if obj is None: return {}
+    if obj is None:
+        return {}
     if isinstance(obj, dict):
         if "data" in obj:
             d = obj.get("data")
-            if isinstance(d, list):  return d[0] if d else {}
-            if isinstance(d, dict):  return d
+            if isinstance(d, list):
+                return d[0] if d else {}
+            if isinstance(d, dict):
+                return d
         return obj
-    if isinstance(obj, list): return obj[0] if obj else {}
+    if isinstance(obj, list):
+        return obj[0] if obj else {}
     return {}
 
 def _extract_shipping_total(order_json):
@@ -75,10 +83,12 @@ def _extract_shipping_total(order_json):
     ]
     for c in cands:
         n = _num_centavos(c)
-        if n > 0: return n
+        if n > 0:
+            return n
     return 0
 
 def _extract_tracking(order_json):
+    # confirmado no seu JSON: "frete": {"rastreio": "AM...BR"}
     cands = [
         (order_json.get("frete") or {}).get("rastreio"),
         order_json.get("rastreamento"),
@@ -86,7 +96,8 @@ def _extract_tracking(order_json):
         (order_json.get("order") or {}).get("tracking"),
     ]
     for c in cands:
-        if c: return str(c).strip().upper()
+        if c:
+            return str(c).strip().upper()
     return ""
 
 def _detail_by_id_any(order_id, tried):
@@ -95,7 +106,7 @@ def _detail_by_id_any(order_id, tried):
       1) /order/{id}
       2) /order?id={id}&limit=1&complete=1
     """
-    # 1)
+    # 1) por id direto
     try:
         u = f"{API_URL}/order/{order_id}"
         tried.append(u)
@@ -103,10 +114,11 @@ def _detail_by_id_any(order_id, tried):
         if _ok(r):
             raw = _json_safe(r)
             obj = _unwrap_first(raw)
-            if obj: return obj, raw
+            if obj:
+                return obj, raw
     except Exception:
         pass
-    # 2)
+    # 2) por query id
     try:
         u = f"{API_URL}/order?id={order_id}&limit=1&complete=1"
         tried.append(u)
@@ -114,7 +126,8 @@ def _detail_by_id_any(order_id, tried):
         if _ok(r):
             raw = _json_safe(r)
             obj = _unwrap_first(raw)
-            if obj: return obj, raw
+            if obj:
+                return obj, raw
     except Exception:
         pass
     return {}, {}
@@ -136,7 +149,7 @@ def ping():
     if not WBUY_TOKEN:
         return jsonify({"ok": False, "reason": "no_token"}), 200
     try:
-        u = f"{API_URL}/order?limit=1"
+        u = f"{API_URL}/order?limit=0,1"
         r = requests.get(u, headers=HEADERS, timeout=20)
         return jsonify({"ok": _ok(r)}), 200
     except Exception as e:
@@ -153,8 +166,8 @@ def by_id(order_id):
         trk  = _extract_tracking(obj)
         return jsonify({
             "order_id": str(order_id),
-            "shipping_total": ship,               # centavos
-            "shipping_total_reais": ship/100.0,   # reais
+            "shipping_total": ship,               # em centavos
+            "shipping_total_reais": ship / 100.0, # em reais
             "tracking": trk,
             "debug": {"tried": tried}
         }), 200
@@ -165,7 +178,10 @@ def by_id(order_id):
 def by_tracking_or_id():
     """
     /api/v2/wbuy/order?id=1234
-    /api/v2/wbuy/order?tracking=AA123456789BR[&deep=1]   (deep=1 default)
+    /api/v2/wbuy/order?tracking=AA123456789BR[&deep=1][&pages=5][&limit=100]
+      - deep=1 habilita varredura por status com paginação estilo WBuy (limit=offset,qtde)
+      - pages: quantas janelas por status (default 5)
+      - limit: tamanho da janela (default 100; WBuy aceita "limit=OFFSET,QTDE")
     """
     order_id = (request.args.get("id") or "").strip()
     if order_id:
@@ -181,7 +197,7 @@ def by_tracking_or_id():
 
     # 1) tentativa rápida via search
     try:
-        u = f"{API_URL}/order?limit=100&complete=1&search={tracking}"
+        u = f"{API_URL}/order?limit=0,100&complete=1&search={tracking}"
         tried.append(u)
         r = requests.get(u, headers=HEADERS, timeout=35)
         if _ok(r):
@@ -203,51 +219,82 @@ def by_tracking_or_id():
         pass
 
     if not deep:
-        return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
+        return jsonify({
+            "order_id": None,
+            "shipping_total": 0,
+            "tracking": None,
+            "debug": {"matches": [], "tried": tried}
+        }), 200
 
-    # 2) varredura robusta (status 1..18, 5 páginas de 100)
-    STATUSES = list(range(1, 19))
-    MAX_PAGES_PER_STATUS = 5
-    LIMIT = 100
+    # 2) varredura robusta usando ponteiro (limit=offset,qtde) — CORREÇÃO IMPORTANTE
+    STATUSES = list(range(1, 19))          # 1..18
+    MAX_PAGES_PER_STATUS = 5               # pode ajustar via &pages=
+    LIMIT = 100                            # pode ajustar via &limit=
+
+    # permitir ajuste por query string
+    try:
+        MAX_PAGES_PER_STATUS = max(1, min(50, int(request.args.get("pages", MAX_PAGES_PER_STATUS))))
+        LIMIT = max(20, min(200, int(request.args.get("limit", LIMIT))))
+    except Exception:
+        pass
 
     for status in STATUSES:
         for page in range(1, MAX_PAGES_PER_STATUS + 1):
             try:
-                u = f"{API_URL}/order?limit={LIMIT}&complete=1&page={page}&status={status}"
+                offset = (page - 1) * LIMIT
+                # >>> paginação correta na WBuy: limit=OFFSET,QTDE
+                u = f"{API_URL}/order?limit={offset},{LIMIT}&complete=1&status={status}"
                 tried.append(u)
+
                 r = requests.get(u, headers=HEADERS, timeout=40)
                 if not _ok(r):
                     continue
+
                 raw = _json_safe(r)
 
+                # normaliza array de itens
                 arr = []
-                if isinstance(raw, dict): arr = raw.get("data", [])
-                elif isinstance(raw, list): arr = raw
-                if isinstance(arr, dict): arr = arr.get("data", [])
+                if isinstance(raw, dict):
+                    arr = raw.get("data", [])
+                elif isinstance(raw, list):
+                    arr = raw
+                if isinstance(arr, dict):     # casos {data:{data:[...]}}
+                    arr = arr.get("data", [])
                 if not isinstance(arr, list) or not arr:
-                    break
+                    break  # próxima combinação de status
 
+                # checa cada item pelo DETALHE (para ler frete.rastreio)
                 for item in arr:
                     oid = item.get("id") or item.get("order_id")
                     if not oid:
                         continue
+
                     obj, _ = _detail_by_id_any(oid, tried)
                     if not obj:
                         continue
+
                     trk = _extract_tracking(obj)
-                    if trk == tracking:
+                    if trk and trk.strip().upper() == tracking:
                         ship = _extract_shipping_total(obj)
                         return jsonify({
                             "order_id": str(oid),
                             "shipping_total": ship,
-                            "shipping_total_reais": ship/100.0,
+                            "shipping_total_reais": ship / 100.0,
                             "tracking": trk,
                             "debug": {"matches": ["deep"], "tried": tried}
                         }), 200
+
             except Exception:
+                # segue a varredura mesmo se uma página falhar
                 continue
 
-    return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
+    # não achou
+    return jsonify({
+        "order_id": None,
+        "shipping_total": 0,
+        "tracking": None,
+        "debug": {"matches": [], "tried": tried}
+    }), 200
 
 # registra blueprint
 app.register_blueprint(api_v2)
