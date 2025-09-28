@@ -27,7 +27,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 def _ok(r): return r.status_code in (200, 201, 202)
 
 def _dt(date_str):
-    """YYYY-MM-DD -> date | None"""
+    """YYYY-MM-DD -> date | None (para os filtros da query)."""
     if not date_str:
         return None
     try:
@@ -46,18 +46,22 @@ def _unwrap_list(obj):
             v = obj.get(k)
             if isinstance(v, list):
                 return v
-        # às vezes já vem um único objeto
         return [obj]
     return []
 
+# -------- rastreio mais abrangente --------
 def _extract_tracking(o):
-    """Tenta achar o rastreio em campos comuns."""
+    f = o.get("frete") or {}
+    ship = o.get("shipping") or {}
     cands = [
-        (o.get("frete") or {}).get("rastreio"),
+        f.get("rastreio"),
+        f.get("codigo_rastreamento"),
+        f.get("tracking_code"),
+        ship.get("tracking"),
+        ship.get("tracking_code"),
         o.get("rastreamento"),
-        (o.get("shipping") or {}).get("tracking"),
-        (o.get("order") or {}).get("tracking"),
         o.get("tracking"),
+        o.get("tracking_code"),
     ]
     for c in cands:
         if c:
@@ -86,11 +90,11 @@ def health():
 def list_orders():
     """
     Lista pedidos com seus códigos de rastreio.
-    Parâmetros:
+    Params:
       - from: YYYY-MM-DD (opcional)
       - to:   YYYY-MM-DD (opcional)
       - q:    orderId numérico OU código de rastreio (AA123456789BR) (opcional)
-      - status: inteiro da WBuy (opcional, pode repetir ?status=1&status=2...)
+      - status: inteiro da WBuy (opcional, repetível ?status=1&status=2)
       - max_pages: int (default 8)
       - page_size: int (default 100)
     Retorno:
@@ -105,74 +109,82 @@ def list_orders():
     max_pages = int(request.args.get("max_pages") or 8)
     page_size = int(request.args.get("page_size") or 100)
 
-    # Filtros opcionais por status (pode vir múltiplo)
-    statuses = request.args.getlist("status")
-    statuses = [s for s in statuses if s.isdigit()]
+    # status (opcional). Se não vier, tentaremos também SEM status (fallback).
+    statuses = [s for s in request.args.getlist("status") if s.isdigit()]
+    try_without_status = not statuses
     if not statuses:
-        # se não passar status, buscamos todas as situações comuns (1..18)
         statuses = [str(i) for i in range(1, 19)]
 
-    rows = []
-
-    # Atalho: q = orderId -> busca direta do detalhe
+    # Atalho: detalhe por orderId exato
     if _is_order_id(q):
         u = f"{API_URL}/order/{q}"
         r = requests.get(u, headers=HEADERS, timeout=30)
         if not _ok(r):
             return jsonify({"ok": False, "error": f"HTTP {r.status_code}"}), r.status_code
         o = r.json() if r.text else {}
-        # Alguns formatos retornam objeto direto; normaliza:
         if isinstance(o, dict) and "data" in o and isinstance(o["data"], list) and o["data"]:
             o = o["data"][0]
         row = {
             "orderId": o.get("id"),
             "numero": o.get("numero") or o.get("order_number"),
-            "createdAt": (o.get("created_at") or o.get("criado_em") or ""),
+            "createdAt": (o.get("created_at") or o.get("criado_em") or o.get("date") or o.get("data") or o.get("emissao") or ""),
             "updatedAt": (o.get("updated_at") or o.get("atualizado_em") or ""),
             "tracking": _extract_tracking(o),
             "service": _extract_service(o),
         }
         return jsonify({"ok": True, "rows": [row]})
 
-    # Varredura paginada por status
-    for status in statuses:
-        for page in range(1, max_pages + 1):
-            url = f"{API_URL}/order?page={page}&page_size={page_size}&status={status}"
-            r = requests.get(url, headers=HEADERS, timeout=40)
-            if not _ok(r):
-                continue
+    def fetch_loop(with_status=True):
+        acc = []
+        status_list = statuses if with_status else [None]
+        for status in status_list:
+            for page in range(1, max_pages + 1):
+                params = {"page": page, "page_size": page_size}
+                if status:
+                    params["status"] = status
+                r = requests.get(f"{API_URL}/order", headers=HEADERS, params=params, timeout=40)
+                if not _ok(r):
+                    break
+                items = _unwrap_list(r.json() if r.text else {})
+                if not items:
+                    break
 
-            items = _unwrap_list(r.json() if r.text else {})
-            if not items:
-                break
+                for o in items:
+                    # aceita vários nomes de data; se não parsear, NÃO filtra por data
+                    created_raw = (o.get("created_at") or o.get("criado_em") or
+                                   o.get("date") or o.get("data") or
+                                   o.get("emissao") or o.get("emitted_at") or "")
+                    created = str(created_raw)[:10]
+                    created_date = _dt(created)
 
-            for o in items:
-                created = (o.get("created_at") or o.get("criado_em") or "")[:10]
-                created_date = _dt(created)
+                    if f_from and created_date and created_date < f_from:
+                        continue
+                    if f_to and created_date and created_date > f_to:
+                        continue
 
-                # filtro por período
-                if f_from and (not created_date or created_date < f_from):
-                    continue
-                if f_to and (not created_date or created_date > f_to):
-                    continue
+                    tracking = _extract_tracking(o)
+                    if q and _is_tracking(q) and (tracking or "").upper() != q.upper():
+                        continue
 
-                tracking = _extract_tracking(o)
-                # filtro por q = tracking
-                if q and _is_tracking(q) and tracking.upper() != q.upper():
-                    continue
+                    acc.append({
+                        "orderId": o.get("id"),
+                        "numero": o.get("numero") or o.get("order_number"),
+                        "createdAt": created_raw,
+                        "updatedAt": o.get("updated_at") or o.get("atualizado_em") or "",
+                        "tracking": tracking,
+                        "service": _extract_service(o),
+                    })
 
-                rows.append({
-                    "orderId": o.get("id"),
-                    "numero": o.get("numero") or o.get("order_number"),
-                    "createdAt": o.get("created_at") or o.get("criado_em") or "",
-                    "updatedAt": o.get("updated_at") or o.get("atualizado_em") or "",
-                    "tracking": tracking,
-                    "service": _extract_service(o),
-                })
+                if len(items) < page_size:
+                    break
+        return acc
 
-            # heurística: fim da listagem se trouxe menos que page_size
-            if len(items) < page_size:
-                break
+    # 1ª passada: com status 1..18
+    rows = fetch_loop(with_status=True)
+
+    # fallback: se vazio e você não passou status manualmente, tenta sem status
+    if not rows and try_without_status:
+        rows = fetch_loop(with_status=False)
 
     return jsonify({"ok": True, "rows": rows})
 
