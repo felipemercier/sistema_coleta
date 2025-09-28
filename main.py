@@ -1,13 +1,13 @@
-from flask import Flask, jsonify, request, make_response, Blueprint
+from flask import Flask, jsonify, request, Blueprint
 from flask_cors import CORS
 import os, requests
 
 # ==============================
 # Config
 # ==============================
-API_URL     = os.getenv("WBUY_API_URL", "https://sistema.sistemawbuy.com.br/api/v1").rstrip("/")
-WBUY_TOKEN  = (os.getenv("WBUY_TOKEN") or "").strip()
-PORT        = int(os.getenv("PORT", "5000"))
+API_URL    = os.getenv("WBUY_API_URL", "https://sistema.sistemawbuy.com.br/api/v1").rstrip("/")
+WBUY_TOKEN = (os.getenv("WBUY_TOKEN") or "").strip()
+PORT       = int(os.getenv("PORT", "5000"))
 
 HEADERS = {
     "Authorization": f"Bearer {WBUY_TOKEN}" if WBUY_TOKEN else "",
@@ -22,7 +22,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
 # ------------------------------ Helpers ------------------------------
-def _ok(r): 
+def _ok(r):
     return r.status_code in (200, 201, 202)
 
 def _json_safe(resp):
@@ -79,7 +79,6 @@ def _extract_shipping_total(order_json):
         (order_json.get("frete") or {}).get("valor"),
         (order_json.get("totals") or {}).get("shipping"),
         (order_json.get("order") or {}).get("shipping_total"),
-        # às vezes vem por item (fallback)
         (order_json.get("valor_total") or {}).get("frete"),
     ]
     for c in cands:
@@ -106,7 +105,7 @@ def _detail_by_id_any(order_id, tried):
       1) /order/{id}
       2) /order?id={id}&limit=1&complete=1
     """
-    # 1)
+    # 1) detalhe direto
     try:
         u = f"{API_URL}/order/{order_id}"
         tried.append(u)
@@ -118,7 +117,7 @@ def _detail_by_id_any(order_id, tried):
                 return obj, raw
     except Exception:
         pass
-    # 2)
+    # 2) detalhe via query
     try:
         u = f"{API_URL}/order?id={order_id}&limit=1&complete=1"
         tried.append(u)
@@ -155,61 +154,107 @@ def ping():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
 
-# -------- NOVA ROTA: procurar pelo RASTREIO de forma direta --------
+# -------- NOVA ROTA: procurar pelo RASTREIO (com fallback deep) --------
 @api_v2.get("/order/by-tracking/<tracking>")
 def by_tracking(tracking):
     """
-    Busca direta na WBuy usando ?search=<tracking>.
-    Retorna: order_id, shipping_total (centavos), shipping_total_reais, tracking.
+    Busca um pedido pelo código de rastreio.
+    1) Tenta busca rápida via ?search (muitas vezes NÃO indexa o rastreio).
+    2) Se falhar, varredura profunda por status/páginas e compara frete.rastreio.
     """
     tried = []
-    try:
-        tracking = (tracking or "").strip().upper()
-        if not tracking:
-            return jsonify({"error": "tracking_required"}), 400
+    tracking = (tracking or "").strip().upper()
+    if not tracking:
+        return jsonify({"error": "tracking_required"}), 400
 
-        # tentativa direta por search
+    # 1) tentativa rápida
+    try:
         u = f"{API_URL}/order?search={tracking}&limit=1&complete=1"
         tried.append(u)
         r = requests.get(u, headers=HEADERS, timeout=35)
-        if not _ok(r):
-            return jsonify({"error": "not_found", "debug": {"tried": tried}}), 404
+        if _ok(r):
+            raw = _json_safe(r)
+            obj = _unwrap_first(raw)
+            if obj:
+                oid = str(obj.get("id") or obj.get("order_id") or "").strip()
+                ship = _extract_shipping_total(obj)
+                trk  = _extract_tracking(obj)
+                return jsonify({
+                    "order_id": oid or None,
+                    "shipping_total": ship,
+                    "shipping_total_reais": ship / 100.0,
+                    "tracking": trk or None,
+                    "debug": {"matches": ["search"], "tried": tried}
+                }), 200
+    except Exception:
+        pass
 
-        raw = _json_safe(r)
-        obj = _unwrap_first(raw)
+    # 2) fallback: varredura profunda
+    try:
+        STATUSES = list(range(1, 19))   # 1..18
+        LIMIT = 100
+        MAX_PAGES = 5
 
-        if not obj:
-            return jsonify({"error": "not_found", "debug": {"tried": tried}}), 404
+        for status in STATUSES:
+            for page in range(1, MAX_PAGES + 1):
+                u = f"{API_URL}/order?limit={LIMIT}&complete=1&page={page}&status={status}"
+                tried.append(u)
+                r = requests.get(u, headers=HEADERS, timeout=40)
+                if not _ok(r):
+                    continue
+                raw = _json_safe(r)
 
-        oid = str(obj.get("id") or obj.get("order_id") or "").strip()
-        ship = _extract_shipping_total(obj)
-        trk  = _extract_tracking(obj)
+                arr = []
+                if isinstance(raw, dict):
+                    arr = raw.get("data", [])
+                elif isinstance(raw, list):
+                    arr = raw
+                if isinstance(arr, dict):
+                    arr = arr.get("data", [])
+                if not isinstance(arr, list) or not arr:
+                    break
 
-        return jsonify({
-            "order_id": oid or None,
-            "shipping_total": ship,
-            "shipping_total_reais": ship / 100.0,
-            "tracking": trk or None,
-            "debug": {"tried": tried}
-        }), 200
-
+                for item in arr:
+                    oid = item.get("id") or item.get("order_id")
+                    if not oid:
+                        continue
+                    obj, _ = _detail_by_id_any(oid, tried)
+                    if not obj:
+                        continue
+                    trk = _extract_tracking(obj)
+                    if trk == tracking:
+                        ship = _extract_shipping_total(obj)
+                        return jsonify({
+                            "order_id": str(oid),
+                            "shipping_total": ship,
+                            "shipping_total_reais": ship / 100.0,
+                            "tracking": trk,
+                            "debug": {"matches": ["deep"], "tried": tried}
+                        }), 200
     except Exception as e:
         return jsonify({"error": str(e), "debug": {"tried": tried}}), 500
 
-# -------- rotas que você já tinha (por ID e por query) --------
+    return jsonify({
+        "order_id": None,
+        "shipping_total": 0,
+        "tracking": None,
+        "debug": {"matches": [], "tried": tried}
+    }), 200
+
+# -------- rotas por ID e por query (mantidas) --------
 @api_v2.get("/order/<order_id>")
 def by_id(order_id):
     tried = []
     try:
-        obj, raw = _detail_by_id_any(order_id, tried)
+        obj, _ = _detail_by_id_any(order_id, tried)
         if not obj:
             return jsonify({"error": "not_found", "debug": {"tried": tried}}), 404
         ship = _extract_shipping_total(obj)
         trk  = _extract_tracking(obj)
         return jsonify({
             "order_id": str(order_id),
-            "shipping_total": ship,               # centavos
-            "shipping_total_reais": ship / 100.0, # reais
+            "shipping_total": ship,
+            "shipping_total_reais": ship / 100.0,
             "tracking": trk,
             "debug": {"tried": tried}
         }), 200
@@ -220,7 +265,7 @@ def by_id(order_id):
 def by_tracking_or_id():
     """
     /api/v2/wbuy/order?id=1234
-    /api/v2/wbuy/order?tracking=AA123456789BR[&deep=1]   (deep=1 default)
+    /api/v2/wbuy/order?tracking=AA123456789BR[&deep=1]  (deep=1 default)
     """
     order_id = (request.args.get("id") or "").strip()
     if order_id:
@@ -234,7 +279,7 @@ def by_tracking_or_id():
 
     tried = []
 
-    # 1) tentativa rápida via search
+    # 1) tentativa via search
     try:
         u = f"{API_URL}/order?limit=1&complete=1&search={tracking}"
         tried.append(u)
@@ -258,9 +303,10 @@ def by_tracking_or_id():
         pass
 
     if not deep:
-        return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
+        return jsonify({"order_id": None, "shipping_total": 0, "tracking": None,
+                        "debug": {"matches": [], "tried": tried}}), 200
 
-    # 2) varredura robusta (status 1..18, 5 páginas de 100) — mantém compat
+    # 2) deep scan (compat)
     STATUSES = list(range(1, 19))
     MAX_PAGES_PER_STATUS = 5
     LIMIT = 100
@@ -276,11 +322,11 @@ def by_tracking_or_id():
                 raw = _json_safe(r)
 
                 arr = []
-                if isinstance(raw, dict): 
+                if isinstance(raw, dict):
                     arr = raw.get("data", [])
-                elif isinstance(raw, list): 
+                elif isinstance(raw, list):
                     arr = raw
-                if isinstance(arr, dict): 
+                if isinstance(arr, dict):
                     arr = arr.get("data", [])
                 if not isinstance(arr, list) or not arr:
                     break
@@ -305,7 +351,8 @@ def by_tracking_or_id():
             except Exception:
                 continue
 
-    return jsonify({"order_id": None, "shipping_total": 0, "tracking": None, "debug": {"matches": [], "tried": tried}}), 200
+    return jsonify({"order_id": None, "shipping_total": 0, "tracking": None,
+                    "debug": {"matches": [], "tried": tried}}), 200
 
 # registra blueprint
 app.register_blueprint(api_v2)
