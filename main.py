@@ -102,16 +102,16 @@ def _discover_pagination():
         {"mode": "limit_only", "keys": {"limit":"limit"},                         "size": 1000},
     ]
 
-    # 1) Tenta sem paginação — se vier >0, já sabemos que funciona, mas talvez limitado
+    # 1) Sem paginação
     items0, js0, st0 = _fetch_list({})
     if st0 == 200 and items0:
-        # tenta descobrir se aceita 'limit' para ampliar
+        # tenta ampliar com 'limit'
         itemsL, _, stL = _fetch_list({"limit": 1000})
         if stL == 200 and len(itemsL) > len(items0):
             return {"mode":"limit_only", "keys":{"limit":"limit"}, "size":1000}
         return {"mode":"none", "keys":{}, "size":len(items0)}
 
-    # 2) Testa candidatos de paginação (pedindo 2 páginas diferentes)
+    # 2) Testa candidatos
     for c in candidates:
         mode, keys, size = c["mode"], c["keys"], c["size"]
         if mode == "page":
@@ -122,7 +122,7 @@ def _discover_pagination():
             if s1 == 200 and it1 and s2 == 200 and it2 and (it1[0] != it2[0]):
                 return {"mode": mode, "keys": keys, "size": size}
         elif mode == "offset":
-            p1 = {keys["offset"]: 0, keys["limit"]: size}
+            p1 = {keys["offset"]: 0,   keys["limit"]: size}
             p2 = {keys["offset"]: size, keys["limit"]: size}
             it1, _, s1 = _fetch_list(p1)
             it2, _, s2 = _fetch_list(p2)
@@ -134,8 +134,62 @@ def _discover_pagination():
             if s == 200 and it:
                 return {"mode": mode, "keys": keys, "size": size}
 
-    # fallback duro
     return {"mode":"none", "keys":{}, "size":100}
+
+def _normalize_tracking(s: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+
+def _find_order_by_tracking(tracking: str, max_pages: int = 80):
+    """
+    Procura um pedido cujo frete.rastreio == tracking,
+    varrendo as páginas conforme a paginação descoberta.
+    Retorna o objeto do pedido (dict) ou None.
+    """
+    tnorm = _normalize_tracking(tracking)
+    if not tnorm:
+        return None
+
+    pg = _discover_pagination()
+    mode, keys, size = pg["mode"], pg["keys"], pg["size"]
+
+    def hit(params=None):
+        items, _, st = _fetch_list(params or {})
+        return items if st == 200 else []
+
+    if mode in ("none", "limit_only"):
+        params = {} if mode == "none" else {keys["limit"]: size}
+        for o in hit(params):
+            if _normalize_tracking(_extract_tracking(o)) == tnorm:
+                return o
+        return None
+
+    if mode == "page":
+        page = 1
+        while page <= max_pages:
+            params = {keys["page"]: page, keys["size"]: size}
+            items = hit(params)
+            if not items:
+                break
+            for o in items:
+                if _normalize_tracking(_extract_tracking(o)) == tnorm:
+                    return o
+            page += 1
+        return None
+
+    if mode == "offset":
+        offset = 0
+        for _ in range(max_pages):
+            params = {keys["offset"]: offset, keys["limit"]: size}
+            items = hit(params)
+            if not items:
+                break
+            for o in items:
+                if _normalize_tracking(_extract_tracking(o)) == tnorm:
+                    return o
+            offset += size
+        return None
+
+    return None
 
 # --------------- Health ---------------
 @app.get("/")
@@ -150,9 +204,9 @@ def health():
 @app.get("/api/wbuy/orders")
 def list_orders():
     """
-    Lista pedidos com ID e frete.rastreio, varrendo páginas automaticamente.
+    Lista pedidos com ID, rastreio e serviço, varrendo páginas automaticamente.
     Params:
-      - from, to: YYYY-MM-DD
+      - from, to: YYYY-MM-DD (padrão: últimos 30 dias)
       - q: orderId numérico (atalho)
       - max_pages: segurança (default 50)
     """
@@ -177,8 +231,8 @@ def list_orders():
             return jsonify({"ok": True, "from": str(dfrom), "to": str(dto), "count": 1, "rows": [{
                 "orderId": o.get("id"),
                 "numero": o.get("numero") or o.get("order_number") or o.get("identificacao"),
-                "tracking": (frete.get("rastreio") or "").strip().upper(),
-                "service": (frete.get("servico") or ""),
+                "tracking": _extract_tracking(o),
+                "service": _extract_service(o),
                 "createdAt": raw,
                 "updatedAt": o.get("updated_at") or o.get("atualizado_em") or "",
             }]})
@@ -193,29 +247,26 @@ def list_orders():
         for o in items:
             raw, d = _created_any(o)
             if d:
-                if d < dfrom:  # já passou do início do período
-                    continue  # ainda pode ter itens mais à frente; não quebra aqui
+                if d < dfrom:
+                    continue
                 if d > dto:
                     continue
             oid = o.get("id")
             if not oid or oid in seen:
                 continue
             seen.add(oid)
-            frete = o.get("frete") or {}
             rows.append({
                 "orderId": oid,
                 "numero": o.get("numero") or o.get("order_number") or o.get("identificacao"),
-                "tracking": (frete.get("rastreio") or "").strip().upper(),
-                "service": (frete.get("servico") or ""),
+                "tracking": _extract_tracking(o),
+                "service": _extract_service(o),
                 "createdAt": raw,
                 "updatedAt": o.get("updated_at") or o.get("atualizado_em") or "",
             })
             added += 1
         return added
 
-    mode = pg["mode"]
-    keys = pg["keys"]
-    size = pg["size"]
+    mode = pg["mode"]; keys = pg["keys"]; size = pg["size"]
 
     if mode == "none":
         items, _, st = _fetch_list({})
@@ -237,11 +288,9 @@ def list_orders():
             if st != 200 or not items:
                 break
             add_rows(items)
-            # heurística: se a menor data desse lote já for < dfrom e a lista vier ordenada desc, podemos parar
             dates = [_created_any(o)[1] for o in items if _created_any(o)[1] is not None]
             if dates and min(dates) and min(dates) < dfrom:
-                # próximo page só teria ainda mais antigos
-                # ainda assim avançamos mais uma página para capturar fronteira do dia
+                # mais uma página para capturar fronteira e sai
                 page += 1
                 items2, _, st2 = _fetch_list({keys["page"]: page, keys["size"]: size})
                 if st2 == 200 and items2:
@@ -259,7 +308,6 @@ def list_orders():
             add_rows(items)
             dates = [_created_any(o)[1] for o in items if _created_any(o)[1] is not None]
             if dates and min(dates) and min(dates) < dfrom:
-                # mesmo raciocínio da paginação por página
                 offset += size
                 items2, _, st2 = _fetch_list({keys["offset"]: offset, keys["limit"]: size})
                 if st2 == 200 and items2:
@@ -268,6 +316,34 @@ def list_orders():
             offset += size
 
     return jsonify({"ok": True, "from": str(dfrom), "to": str(dto), "count": len(rows), "rows": rows})
+
+# --------------- Lookup por rastreio ---------------
+@app.get("/api/wbuy/lookup")
+def lookup_by_tracking():
+    """
+    GET /api/wbuy/lookup?tracking=AA123456789BR
+    Retorna: { ok, found, row }
+    row => { orderId, numero, tracking, valorFrete, service, createdAt, updatedAt }
+    """
+    tracking = (request.args.get("tracking") or "").strip()
+    if not tracking:
+        return jsonify({"ok": False, "error": "Parâmetro tracking é obrigatório."}), 400
+
+    o = _find_order_by_tracking(tracking, max_pages=int(request.args.get("max_pages") or 80))
+    if not o:
+        return jsonify({"ok": True, "found": False, "row": None})
+
+    frete = o.get("frete") or {}
+    row = {
+        "orderId": o.get("id"),
+        "numero": o.get("numero") or o.get("order_number") or o.get("identificacao"),
+        "tracking": _extract_tracking(o),
+        "valorFrete": str(frete.get("valor") or ""),
+        "service": _extract_service(o),
+        "createdAt": o.get("data") or o.get("created_at") or o.get("criado_em") or "",
+        "updatedAt": o.get("updated_at") or o.get("atualizado_em") or "",
+    }
+    return jsonify({"ok": True, "found": True, "row": row})
 
 # --------------- Run ---------------
 if __name__ == "__main__":
