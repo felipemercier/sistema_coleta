@@ -96,35 +96,73 @@ def health():
 # --------------- Diagnóstico ---------------
 @app.get("/api/wbuy/probe")
 def probe():
+    """
+    Testa várias combinações de autenticação e endpoints para descobrir
+    o formato aceito pela sua instância WBuy a partir do Render.
+    """
+    token = WBUY_TOKEN or ""
+    endpoints = ["order", "order/probe", "orders", "pedido", "pedidos"]
+    status_keys = ["status", "situacao", None]
     page = int(request.args.get("page") or 1)
-    page_size = int(request.args.get("page_size") or 50)
-    passed_status = request.args.get("status")
+    page_size = int(request.args.get("page_size") or 25)
+
+    # Diferentes variações de headers
+    header_variants = [
+        {"Authorization": f"Bearer {token}"},
+        {"Authorization": token},
+        {"token": token},
+        {"X-Auth-Token": token},
+        # combos
+        {"Authorization": f"Bearer {token}", "token": token},
+        {"Authorization": f"Bearer {token}", "X-Auth-Token": token},
+    ]
+
+    # Diferentes variações de query params
+    param_variants = [
+        {},                           # sem token na query
+        {"token": token},             # token na query
+    ]
 
     tried = []
-    for ep in LIST_ENDPOINTS:
-        for key in STATUS_PARAM_KEYS + [None]:
-            params = _auth_params({"page": page, "page_size": page_size})
-            if passed_status and key:
-                params[key] = passed_status
-            url = f"{API_URL}/{ep}"
-            r = requests.get(url, headers=HEADERS, params=params, timeout=40)
+    for ep in endpoints:
+        for h in header_variants:
+            # base headers (mantém Accept/User-Agent)
+            hdr = {k: v for k, v in HEADERS.items()
+                   if k not in ("Authorization", "token", "X-Auth-Token")}
+            hdr.update(h)
 
-            item = {"endpoint": ep, "status_key": key, "http": r.status_code}
-            try:
-                js = r.json() if r.text else {}
-            except Exception:
-                js = {}
-            items = _unwrap_list(js)
-            item["count"] = len(items)
-            item["keys"] = list(js.keys()) if isinstance(js, dict) else type(js).__name__
-            item["params"] = params
-            item["sample"] = (items[0] if items else None)
-            tried.append(item)
+            for sk in status_keys:
+                for pv in param_variants:
+                    params = {"page": page, "page_size": page_size}
+                    if sk: params[sk] = "5"  # só para não ficar vazio (qualquer valor)
+                    params.update(pv)
 
-            if _ok(r) and items:
-                return jsonify({"ok": True, "best": item, "tried": tried})
+                    url = f"{API_URL}/{ep}"
+                    try:
+                        r = requests.get(url, headers=hdr, params=params, timeout=45)
+                        js = {}
+                        try:
+                            js = r.json() if r.text else {}
+                        except Exception:
+                            pass
+                        items = _unwrap_list(js)
+                        item = {
+                            "endpoint": ep,
+                            "http": r.status_code,
+                            "params": params,
+                            "headers_used": list(h.keys()),
+                            "message": (js.get("message") if isinstance(js, dict) else None),
+                            "keys": (list(js.keys()) if isinstance(js, dict) else type(js).__name__),
+                            "count": len(items),
+                            "sample": (items[0] if items else None),
+                        }
+                        tried.append(item)
+                        if r.status_code == 200 and items:
+                            return jsonify({"ok": True, "best": item, "tried": tried})
+                    except Exception as e:
+                        tried.append({"endpoint": ep, "error": str(e), "headers_used": list(h.keys()), "params": params})
 
-    return jsonify({"ok": False, "message": "Nenhum item retornou.", "tried": tried})
+    return jsonify({"ok": False, "message": "Nenhuma combinação retornou itens.", "tried": tried})
 
 # --------------- Listagem por período ---------------
 @app.get("/api/wbuy/orders")
